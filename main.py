@@ -50,11 +50,30 @@ import requests
 # CONFIG
 # ----------------------------------------------------------------------
 
-HISTORIC_COINS = [
+ANCHOR_COINS_SOL = [
     {"symbol": "BONK", "chain": "sol", "address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"},
     {"symbol": "WIF", "chain": "sol", "address": "EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm"},
+]
+ANCHOR_COINS_ETH = [
     {"symbol": "PEPE", "chain": "eth", "address": "0x6982508145454Ce325dDbE47a25d4ec3d2311933"},
 ]
+ANCHOR_COINS = ANCHOR_COINS_SOL + ANCHOR_COINS_ETH
+
+# Tokens "obvios" que casi todas las wallets tienen (stablecoins, SOL
+# wrapeado, ETH wrapeado). Si los dejamos en el analisis de overlap,
+# el bot los va a marcar como "señal" constantemente solo porque todo
+# el mundo los tiene -- no porque varias wallets hayan comprado lo
+# mismo recientemente. Se filtran antes de buscar overlap.
+EXCLUDED_MINTS = {
+    # Solana
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "So11111111111111111111111111111111111111112",  # SOL wrapeado
+    # Ethereum
+    "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+    "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+    "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+}
 
 HELIUS_API_KEY = os.getenv("HELIUS_API_KEY")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY")
@@ -68,6 +87,31 @@ ALERT_THRESHOLD = int(os.getenv("ALERT_THRESHOLD", "7"))
 CYCLE_SECONDS = int(os.getenv("CYCLE_SECONDS", "600"))
 WALLETS_TO_ANALYZE = int(os.getenv("WALLETS_TO_ANALYZE", "5"))
 STATE_FILE = os.getenv("STATE_FILE", "alerted_tokens.json")
+
+# --- Watchlist dinamico de Solana --------------------------------------
+# En vez de hardcodear direcciones (riesgo de tipeo = analizar el token
+# equivocado sin darse cuenta), el bot le pregunta a Dexscreener cuales
+# son los tokens de Solana activos ahora mismo y arma su propia lista.
+# WATCHLIST_SIZE: cuantos tokens like maximo mantiene el watchlist.
+# SEEDS_PER_CYCLE: cuantos de esos se analizan POR CICLO (rotando). Esto
+# existe para no reventar los creditos gratis de Helius -- cada moneda
+# analizada cuesta varias llamadas (early buyers + wallets + balances).
+# Con el default (5), un watchlist de 50 se recorre completo cada ~10
+# ciclos (~100 min con CYCLE_SECONDS=600). Subilo con cuidado.
+WATCHLIST_SIZE = int(os.getenv("WATCHLIST_SIZE", "50"))
+SEEDS_PER_CYCLE = int(os.getenv("SEEDS_PER_CYCLE", "5"))
+WATCHLIST_REFRESH_SECONDS = int(os.getenv("WATCHLIST_REFRESH_SECONDS", str(6 * 3600)))
+WATCHLIST_CACHE_FILE = os.getenv("WATCHLIST_CACHE_FILE", "sol_watchlist.json")
+
+# --- Alertas de precio (SOL / BTC / ETH) --------------------------------
+# Algo totalmente separado del sistema de "compradores tempranos": estas
+# 3 son monedas grandes y ya establecidas, no moonshots nuevos, asi que
+# no tiene sentido buscarles "early buyers". En cambio, el bot avisa
+# cuando el precio se mueve mas de PRICE_ALERT_PCT% desde la ultima vez
+# que aviso (o desde que arranco, para el primer chequeo).
+PRICE_WATCH_COINS = {"SOL": "solana", "BTC": "bitcoin", "ETH": "ethereum"}
+PRICE_ALERT_PCT = float(os.getenv("PRICE_ALERT_PCT", "5"))
+PRICE_STATE_FILE = os.getenv("PRICE_STATE_FILE", "price_baseline.json")
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -259,6 +303,72 @@ def get_wallet_tx_stats(wallet, chain="sol"):
 
 
 # ----------------------------------------------------------------------
+# PASO 1 (extendido): watchlist dinamico de Solana via Dexscreener
+# ----------------------------------------------------------------------
+
+def fetch_solana_watchlist(limit=50):
+    """
+    Arma una lista de hasta `limit` tokens de Solana activos ahora mismo,
+    usando las listas publicas de Dexscreener (sin API key). Devuelve
+    solo direcciones REALES tal como las entrega Dexscreener -- nunca
+    inventadas a mano.
+
+    OJO: los "boosts" de Dexscreener son un producto PAGO (un proyecto
+    paga para aparecer ahi). Eso NO los hace señal de calidad por si
+    solos -- por eso igual pasan por score_token() como cualquier otro
+    candidato antes de que el bot considere alertar.
+    """
+    seen = set()
+    addresses = []
+    for url in (
+        "https://api.dexscreener.com/token-boosts/top/v1",
+        "https://api.dexscreener.com/token-boosts/latest/v1",
+        "https://api.dexscreener.com/token-profiles/latest/v1",
+    ):
+        data = http_get(url)
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            if item.get("chainId") != "solana":
+                continue
+            addr = item.get("tokenAddress")
+            if addr and addr not in seen and addr not in EXCLUDED_MINTS:
+                seen.add(addr)
+                addresses.append(addr)
+            if len(addresses) >= limit:
+                break
+        if len(addresses) >= limit:
+            break
+    return addresses[:limit]
+
+
+def load_watchlist():
+    """Usa el watchlist cacheado si es reciente; si no, lo refresca."""
+    try:
+        with open(WATCHLIST_CACHE_FILE, "r") as f:
+            cache = json.load(f)
+        age = time.time() - cache.get("fetched_at", 0)
+        if age < WATCHLIST_REFRESH_SECONDS and cache.get("addresses"):
+            return cache["addresses"]
+    except Exception:
+        pass
+
+    fresh = fetch_solana_watchlist(WATCHLIST_SIZE)
+    if fresh:
+        try:
+            with open(WATCHLIST_CACHE_FILE, "w") as f:
+                json.dump({"fetched_at": time.time(), "addresses": fresh}, f)
+        except Exception as e:
+            print(f"[ERROR] guardando watchlist: {e}")
+        return fresh
+
+    # Si Dexscreener falla, seguimos con los anchors fijos (BONK/WIF/PEPE)
+    # en vez de dejar al bot sin nada que analizar.
+    print("[AVISO] No se pudo refrescar el watchlist de Solana; sigo solo con los anchors.")
+    return []
+
+
+# ----------------------------------------------------------------------
 # PASO 5: tokens comprados recientemente
 # ----------------------------------------------------------------------
 
@@ -275,8 +385,9 @@ def get_recent_tokens_bought(wallet, chain="sol"):
             r = http_get(url)
             if isinstance(r, dict):
                 for token in r.get("balances", [])[:50]:
-                    if token.get("mint"):
-                        tokens.append(token["mint"])
+                    mint = token.get("mint")
+                    if mint and mint not in EXCLUDED_MINTS:
+                        tokens.append(mint)
         else:
             url = (
                 "https://api.etherscan.io/v2/api?chainid=1&module=account&action=tokentx"
@@ -287,7 +398,8 @@ def get_recent_tokens_bought(wallet, chain="sol"):
                 cutoff = datetime.now() - timedelta(days=30)
                 for tx in r.get("result", [])[:100]:
                     ts = datetime.fromtimestamp(int(tx["timeStamp"]))
-                    if ts > cutoff and tx.get("contractAddress"):
+                    contract = (tx.get("contractAddress") or "").lower()
+                    if ts > cutoff and contract and contract not in EXCLUDED_MINTS:
                         tokens.append(tx["contractAddress"])
     except Exception as e:
         print(f"[ERROR] recent_tokens {wallet[:8]}: {e}")
@@ -368,120 +480,4 @@ def score_token(token_address, overlap_count, chain="sol"):
                 if data.get("is_mintable") is False:
                     score += 1
                     checks["no_mint"] = True
-                if data.get("is_lp_burned"):
-                    score += 1
-                    checks["lp_lock"] = True
-            else:
-                checks["gmgn_bloqueado"] = True
-        except Exception:
-            checks["gmgn_bloqueado"] = True
-
-    return min(score, 10), checks
-
-
-# ----------------------------------------------------------------------
-# Telegram
-# ----------------------------------------------------------------------
-
-def send_telegram_alert(msg):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[ALERTA] {msg}")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        # Sin parse_mode: evita que caracteres como "_" en direcciones
-        # de tokens rompan el parser Markdown de Telegram y la alerta
-        # se pierda en silencio.
-        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[ERROR] telegram: {e}")
-
-
-# ----------------------------------------------------------------------
-# Estado persistente (evita alertas duplicadas del mismo token)
-# ----------------------------------------------------------------------
-
-def load_alerted():
-    try:
-        with open(STATE_FILE, "r") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-
-def save_alerted(alerted):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(list(alerted), f)
-    except Exception as e:
-        print(f"[ERROR] guardando estado: {e}")
-
-
-# ----------------------------------------------------------------------
-# Ciclo principal
-# ----------------------------------------------------------------------
-
-def run_cycle(alerted):
-    print(f"--- Ciclo {datetime.now()} ---")
-    for coin in HISTORIC_COINS:
-        try:
-            print(f"Procesando {coin['symbol']}...")
-            if coin["chain"] == "sol":
-                early = get_sol_early_buyers(coin["address"])
-            else:
-                early = get_eth_early_buyers(coin["address"])
-
-            humans = []
-            for w in early:
-                is_active, is_bot = get_wallet_tx_stats(w, coin["chain"])
-                if is_active and not is_bot:
-                    humans.append(w)
-                time.sleep(0.3)  # respeta rate limits de las APIs gratuitas
-
-            recent_map = {}
-            for w in humans[:WALLETS_TO_ANALYZE]:
-                recent_map[w] = get_recent_tokens_bought(w, coin["chain"])
-                time.sleep(0.5)
-
-            overlaps = find_overlaps(recent_map)
-            for token, info in overlaps.items():
-                if token in alerted:
-                    continue
-                s, checks = score_token(token, info["count"], coin["chain"])
-                print(f"Token {token[:8]} score {s}/10 overlap {info['count']} checks={checks}")
-                if s >= ALERT_THRESHOLD:
-                    msg = (
-                        f"ALPHA {s}/10 DETECTADA\n"
-                        f"Token: {token}\n"
-                        f"Origen: {coin['symbol']}\n"
-                        f"Overlap: {info['count']} wallets\n"
-                        f"GMGN: https://gmgn.ai/sol/{token}\n"
-                        f"Dexscreener: https://dexscreener.com/{coin['chain']}/{token}"
-                    )
-                    send_telegram_alert(msg)
-                    alerted.add(token)
-                    save_alerted(alerted)
-        except Exception as e:
-            # Un fallo procesando UNA moneda no debe tumbar el resto del
-            # ciclo ni el proceso completo.
-            print(f"[ERROR] procesando {coin['symbol']}: {e}")
-
-
-def main():
-    if not HELIUS_API_KEY and not ETHERSCAN_API_KEY:
-        print("[AVISO] No hay HELIUS_API_KEY ni ETHERSCAN_API_KEY configuradas. "
-              "El bot no podra detectar nada hasta que las agregues en Railway.")
-
-    alerted = load_alerted()
-    while True:
-        try:
-            run_cycle(alerted)
-        except Exception as e:
-            # Red de seguridad final: pase lo que pase, el bot sigue vivo.
-            print(f"[ERROR CRITICO] {e}")
-        time.sleep(CYCLE_SECONDS)
-
-
-if __name__ == "__main__":
-    main()
+  
