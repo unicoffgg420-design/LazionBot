@@ -480,4 +480,226 @@ def score_token(token_address, overlap_count, chain="sol"):
                 if data.get("is_mintable") is False:
                     score += 1
                     checks["no_mint"] = True
-  
+  else:
+                checks["gmgn_bloqueado"] = True
+        except Exception:
+            checks["gmgn_bloqueado"] = True
+
+    return min(score, 10), checks
+
+
+# ----------------------------------------------------------------------
+# Telegram
+# ----------------------------------------------------------------------
+
+def send_telegram_alert(msg):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"[ALERTA] {msg}")
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        # Sin parse_mode: evita que caracteres como "_" en direcciones
+        # de tokens rompan el parser Markdown de Telegram y la alerta
+        # se pierda en silencio.
+        r = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg}, timeout=10)
+        r.raise_for_status()
+    except Exception as e:
+        print(f"[ERROR] telegram: {e}")
+
+
+# ----------------------------------------------------------------------
+# Estado persistente (evita alertas duplicadas del mismo token)
+# ----------------------------------------------------------------------
+
+def load_alerted():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def save_alerted(alerted):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump(list(alerted), f)
+    except Exception as e:
+        print(f"[ERROR] guardando estado: {e}")
+
+
+# ----------------------------------------------------------------------
+# Alertas de precio (SOL / BTC / ETH) -- independiente del resto del bot
+# ----------------------------------------------------------------------
+
+def get_prices():
+    """Precios actuales en USD via CoinGecko (gratis, sin API key)."""
+    ids = ",".join(PRICE_WATCH_COINS.values())
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+    data = http_get(url)
+    if not isinstance(data, dict):
+        return {}
+    prices = {}
+    for symbol, cg_id in PRICE_WATCH_COINS.items():
+        p = (data.get(cg_id) or {}).get("usd")
+        if p:
+            prices[symbol] = float(p)
+    return prices
+
+
+def load_price_baseline():
+    try:
+        with open(PRICE_STATE_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_price_baseline(baseline):
+    try:
+        with open(PRICE_STATE_FILE, "w") as f:
+            json.dump(baseline, f)
+    except Exception as e:
+        print(f"[ERROR] guardando price_baseline: {e}")
+
+
+def check_price_moves(baseline):
+    """
+    Compara el precio actual contra el ultimo precio "base" guardado.
+    Si se movio PRICE_ALERT_PCT% o mas (en cualquier direccion), avisa
+    por Telegram y actualiza la base -- asi la proxima alerta solo
+    llega si se mueve otro PRICE_ALERT_PCT% desde ESTE punto, en vez de
+    repetir el mismo aviso cada 10 minutos mientras el precio se
+    mantenga arriba/abajo.
+    """
+    prices = get_prices()
+    if not prices:
+        print("[AVISO] No se pudieron obtener precios de SOL/BTC/ETH (CoinGecko).")
+        return
+
+    changed = False
+    for symbol, price in prices.items():
+        base = baseline.get(symbol)
+        if base is None:
+            baseline[symbol] = price
+            changed = True
+            continue
+
+        pct = (price - base) / base * 100
+        if abs(pct) >= PRICE_ALERT_PCT:
+            direction = "subio" if pct > 0 else "bajo"
+            msg = (
+                f"PRECIO {symbol}: {direction} {abs(pct):.1f}%\n"
+                f"De ${base:,.2f} a ${price:,.2f}"
+            )
+            send_telegram_alert(msg)
+            baseline[symbol] = price
+            changed = True
+
+    if changed:
+        save_price_baseline(baseline)
+
+
+# ----------------------------------------------------------------------
+# Ciclo principal
+# ----------------------------------------------------------------------
+
+_watchlist_rotation_index = 0
+
+
+def get_coins_for_this_cycle():
+    """
+    Devuelve la lista de monedas a analizar en ESTE ciclo:
+    - Los anchors fijos (BONK, WIF, PEPE) SIEMPRE se analizan.
+    - Un lote rotativo del watchlist dinamico de Solana (hasta
+      SEEDS_PER_CYCLE por vuelta), para cubrir el watchlist completo
+      de a poco sin reventar los creditos gratis de Helius.
+    """
+    global _watchlist_rotation_index
+
+    watchlist_addrs = load_watchlist()
+    anchor_addrs = {c["address"] for c in ANCHOR_COINS}
+    rest_addrs = [a for a in watchlist_addrs if a not in anchor_addrs]
+
+    batch = []
+    if rest_addrs and SEEDS_PER_CYCLE > 0:
+        n = min(SEEDS_PER_CYCLE, len(rest_addrs))
+        for i in range(n):
+            addr = rest_addrs[(_watchlist_rotation_index + i) % len(rest_addrs)]
+            batch.append({"symbol": addr[:6], "chain": "sol", "address": addr})
+        _watchlist_rotation_index = (_watchlist_rotation_index + n) % len(rest_addrs)
+
+    return ANCHOR_COINS + batch
+
+
+def run_cycle(alerted, price_baseline):
+    # Chequeo de precio SOL/BTC/ETH -- independiente del resto, va primero
+    # y si falla no debe frenar el analisis de overlap.
+    try:
+        check_price_moves(price_baseline)
+    except Exception as e:
+        print(f"[ERROR] check_price_moves: {e}")
+
+    coins = get_coins_for_this_cycle()
+    print(f"--- Ciclo {datetime.now()} --- ({len(coins)} monedas: {[c['symbol'] for c in coins]})")
+    for coin in coins:
+        try:
+            print(f"Procesando {coin['symbol']}...")
+            if coin["chain"] == "sol":
+                early = get_sol_early_buyers(coin["address"])
+            else:
+                early = get_eth_early_buyers(coin["address"])
+
+            humans = []
+            for w in early:
+                is_active, is_bot = get_wallet_tx_stats(w, coin["chain"])
+                if is_active and not is_bot:
+                    humans.append(w)
+                time.sleep(0.3)  # respeta rate limits de las APIs gratuitas
+
+            recent_map = {}
+            for w in humans[:WALLETS_TO_ANALYZE]:
+                recent_map[w] = get_recent_tokens_bought(w, coin["chain"])
+                time.sleep(0.5)
+
+            overlaps = find_overlaps(recent_map)
+            for token, info in overlaps.items():
+                if token in alerted:
+                    continue
+                s, checks = score_token(token, info["count"], coin["chain"])
+                print(f"Token {token[:8]} score {s}/10 overlap {info['count']} checks={checks}")
+                if s >= ALERT_THRESHOLD:
+                    msg = (
+                        f"ALPHA {s}/10 DETECTADA\n"
+                        f"Token: {token}\n"
+                        f"Origen: {coin['symbol']}\n"
+                        f"Overlap: {info['count']} wallets\n"
+                        f"GMGN: https://gmgn.ai/sol/{token}\n"
+                        f"Dexscreener: https://dexscreener.com/{coin['chain']}/{token}"
+                    )
+                    send_telegram_alert(msg)
+                    alerted.add(token)
+                    save_alerted(alerted)
+        except Exception as e:
+            # Un fallo procesando UNA moneda no debe tumbar el resto del
+            # ciclo ni el proceso completo.
+            print(f"[ERROR] procesando {coin['symbol']}: {e}")
+
+
+def main():
+    if not HELIUS_API_KEY and not ETHERSCAN_API_KEY:
+        print("[AVISO] No hay HELIUS_API_KEY ni ETHERSCAN_API_KEY configuradas. "
+              "El bot no podra detectar nada hasta que las agregues en Railway.")
+
+    alerted = load_alerted()
+    price_baseline = load_price_baseline()
+    while True:
+        try:
+            run_cycle(alerted, price_baseline)
+        except Exception as e:
+            # Red de seguridad final: pase lo que pase, el bot sigue vivo.
+            print(f"[ERROR CRITICO] {e}")
+        time.sleep(CYCLE_SECONDS)
+
+
+if __name__ == "__main__":
+    main()
