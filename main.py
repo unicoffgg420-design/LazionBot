@@ -480,7 +480,7 @@ def score_token(token_address, overlap_count, chain="sol"):
                 if data.get("is_mintable") is False:
                     score += 1
                     checks["no_mint"] = True
-  else:
+            else:
                 checks["gmgn_bloqueado"] = True
         except Exception:
             checks["gmgn_bloqueado"] = True
