@@ -1,5 +1,5 @@
 """
-LAZION HUNTER BOT v2.0
+LAZION HUNTER BOT v2.1
 Bot 24/7 de deteccion de tokens con overlap de "smart money" (metodo GMGN 7 pasos).
 Corregido y endurecido a partir de AREPAPOWER 100x HUNTER BOT.
 
@@ -19,6 +19,22 @@ Cambios clave vs v1 (ver VEREDICTO.md para el detalle completo):
     solo reintenta 10 veces antes de rendirse).
   - Deduplicado de alertas: no se repite el mismo token en cada ciclo.
   - Dependencias no usadas (solana, web3, python-telegram-bot) eliminadas.
+
+v2.1 -- Helius reemplazo completo de API (agosto 2026):
+  - El dominio api.helius.xyz y el endpoint /v0/token/transfers ya NO
+    existen para este uso. Helius migro todo a:
+      * JSON-RPC en mainnet.helius-rpc.com para historial de
+        transacciones (metodo getTransactionsForAddress)
+      * REST en api.helius.xyz/v1/wallet/{address}/balances para
+        balances de wallet (Wallet API nueva)
+  - get_sol_early_buyers ahora usa getTransactionsForAddress sobre la
+    direccion del mint, ordenado cronologicamente (mas antiguo primero),
+    y detecta compradores comparando preTokenBalances/postTokenBalances
+    (patron documentado oficialmente por Helius).
+  - get_wallet_tx_stats usa getTransactionsForAddress en modo
+    "signatures" (mas barato en creditos) para actividad/deteccion de bots.
+  - get_recent_tokens_bought (lado Solana) usa la Wallet API nueva
+    (/v1/wallet/{address}/balances).
 """
 
 import os
@@ -105,25 +121,72 @@ def http_post(url, payload, timeout=20, max_retries=2):
 
 
 # ----------------------------------------------------------------------
+# Helius JSON-RPC (getTransactionsForAddress) -- reemplaza los endpoints
+# REST viejos de api.helius.xyz que ya no existen (ago-2026).
+# ----------------------------------------------------------------------
+
+def helius_rpc(method, params):
+    if not HELIUS_API_KEY:
+        return None
+    url = f"https://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
+    data = http_post(url, {"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+    if not data or "result" not in data:
+        if data and data.get("error"):
+            print(f"[ERROR] Helius RPC {method}: {data['error']}")
+        return None
+    return data["result"]
+
+
+# ----------------------------------------------------------------------
 # PASO 2: early buyers
 # ----------------------------------------------------------------------
 
 def get_sol_early_buyers(token_address, limit=20):
-    if not HELIUS_API_KEY:
+    """
+    Usa getTransactionsForAddress sobre la direccion del MINT, ordenado
+    cronologicamente (las primeras transacciones son las mas antiguas).
+    Un "comprador" es cualquier owner cuyo balance de este mint sube
+    entre preTokenBalances y postTokenBalances de una transaccion --
+    este es el patron que la propia documentacion de Helius recomienda
+    para detectar cambios de balance sin llamadas extra.
+    """
+    result = helius_rpc("getTransactionsForAddress", [
+        token_address,
+        {
+            "transactionDetails": "full",
+            "sortOrder": "asc",
+            "limit": 100,
+            "encoding": "jsonParsed",
+            "maxSupportedTransactionVersion": 0,
+            "filters": {"status": "succeeded"},
+        },
+    ])
+    if not result:
         return []
-    url = f"https://api.helius.xyz/v0/token/transfers?api-key={HELIUS_API_KEY}"
-    data = http_post(url, {"mint": token_address, "limit": 500})
-    if not isinstance(data, list):
-        return []
+
     buyers, seen = [], set()
-    for tx in sorted(data, key=lambda x: x.get("timestamp", 0)):
-        buyer = tx.get("toUserAccount") or tx.get("owner")
-        if buyer and buyer not in seen:
-            seen.add(buyer)
-            buyers.append(buyer)
+    for entry in result.get("data", []):
+        meta = entry.get("meta") or {}
+        pre = meta.get("preTokenBalances") or []
+        post = meta.get("postTokenBalances") or []
+        pre_by_idx = {
+            b.get("accountIndex"): float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            for b in pre if b.get("mint") == token_address
+        }
+        for b in post:
+            if b.get("mint") != token_address:
+                continue
+            owner = b.get("owner")
+            if not owner or owner in seen:
+                continue
+            post_amt = float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            pre_amt = pre_by_idx.get(b.get("accountIndex"), 0)
+            if post_amt > pre_amt:  # el balance subio = compro/recibio
+                seen.add(owner)
+                buyers.append(owner)
         if len(buyers) >= limit:
             break
-    return buyers
+    return buyers[:limit]
 
 
 def get_eth_early_buyers(token_address, limit=20):
@@ -156,11 +219,16 @@ def get_wallet_tx_stats(wallet, chain="sol"):
     """Devuelve (is_active, is_bot) usando una unica llamada a la API."""
     try:
         if chain == "sol":
-            url = f"https://api.helius.xyz/v0/addresses/{wallet}/transactions?api-key={HELIUS_API_KEY}&limit=20"
-            r = http_get(url)
-            if not isinstance(r, list) or not r:
+            # Modo "signatures": mas barato en creditos que "full" y es
+            # todo lo que necesitamos (solo miramos blockTime).
+            result = helius_rpc("getTransactionsForAddress", [
+                wallet,
+                {"transactionDetails": "signatures", "sortOrder": "desc", "limit": 20},
+            ])
+            entries = (result or {}).get("data", [])
+            if not entries:
                 return False, False
-            timestamps = [t.get("timestamp", 0) for t in r if t.get("timestamp")]
+            timestamps = [e.get("blockTime", 0) for e in entries if e.get("blockTime")]
         else:
             url = (
                 "https://api.etherscan.io/v2/api?chainid=1&module=account&action=txlist"
@@ -198,10 +266,15 @@ def get_recent_tokens_bought(wallet, chain="sol"):
     tokens = []
     try:
         if chain == "sol":
-            url = f"https://api.helius.xyz/v0/addresses/{wallet}/balances?api-key={HELIUS_API_KEY}"
+            # Wallet API nueva de Helius (reemplaza /v0/addresses/.../balances,
+            # que ya no existe). Devuelve balance actual, igual que hacia v1.
+            url = (
+                f"https://api.helius.xyz/v1/wallet/{wallet}/balances"
+                f"?api-key={HELIUS_API_KEY}&showZeroBalance=false&showNative=false&limit=100"
+            )
             r = http_get(url)
             if isinstance(r, dict):
-                for token in r.get("tokens", [])[:50]:
+                for token in r.get("balances", [])[:50]:
                     if token.get("mint"):
                         tokens.append(token["mint"])
         else:
